@@ -49,14 +49,22 @@ class TextService:
 
     def _parse_book(self) -> None:
         import zipfile
+        import base64
+        import io
         path = Path(self.daily_book_path)
         if not path.exists():
             log.error("Daily-book file not found: %s", self.daily_book_path)
             return
         try:
-            if path.suffix == ".zip":
+            if path.suffix == ".b64":
+                # base64-encoded zip — used for Render Secret Files (binary not supported)
+                b64 = path.read_text(encoding="utf-8")
+                zip_bytes = base64.b64decode(b64)
+                with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+                    name = zf.namelist()[0]
+                    content = zf.read(name).decode("utf-8")
+            elif path.suffix == ".zip":
                 with zipfile.ZipFile(path, "r") as zf:
-                    # read the first file inside the zip
                     name = zf.namelist()[0]
                     content = zf.read(name).decode("utf-8")
             else:
@@ -179,7 +187,7 @@ class SubscriberService:
 # ---------------------------------------------------------------------------
 # Service init
 # ---------------------------------------------------------------------------
-DAILY_BOOK_PATH  = os.getenv("DAILY_BOOK_PATH", "daily.zip")
+DAILY_BOOK_PATH  = os.getenv("DAILY_BOOK_PATH", "daily.zip.b64")
 BOT_USERNAME     = os.getenv("BOT_USERNAME", "test-bot")
 SUBSCRIBERS_PATH = os.getenv("SUBSCRIBERS_PATH", "subscribers")
 
