@@ -1,12 +1,12 @@
 import logging
-import os
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from datetime import datetime
 
+import os
 from dotenv import load_dotenv
-load_dotenv()  # loads .env if present, otherwise does nothing
+load_dotenv()  # loads .env locally; on Render use Environment Variables in dashboard
 
 from fastapi import FastAPI, Request
 from aiogram import Bot, Dispatcher, Router, types
@@ -179,9 +179,9 @@ class SubscriberService:
 # ---------------------------------------------------------------------------
 # Service init
 # ---------------------------------------------------------------------------
-DAILY_BOOK_PATH  = os.getenv("DAILY_BOOK_PATH", "daily_book.txt")
-BOT_USERNAME     = os.getenv("BOT_USERNAME", "")
-SUBSCRIBERS_PATH = os.getenv("SUBSCRIBERS_PATH", "subscribers.txt")
+DAILY_BOOK_PATH  = os.getenv("DAILY_BOOK_PATH", "daily.zip")
+BOT_USERNAME     = os.getenv("BOT_USERNAME", "test-bot")
+SUBSCRIBERS_PATH = os.getenv("SUBSCRIBERS_PATH", "subscribers")
 
 text_service       = TextService(daily_book_path=DAILY_BOOK_PATH, bot_username=BOT_USERNAME)
 subscriber_service = SubscriberService(file_path=SUBSCRIBERS_PATH)
@@ -251,7 +251,14 @@ async def lifespan(app: FastAPI):
     await bot.session.close()
 
 
-app = FastAPI(lifespan=lifespan)
+# docs enabled only when TRIGGER_SECRET is not set (local dev)
+_local = not os.getenv("TRIGGER_SECRET")
+app = FastAPI(
+    lifespan=lifespan,
+    docs_url="/docs" if _local else None,
+    redoc_url="/redoc" if _local else None,
+    openapi_url="/openapi.json" if _local else None,
+)
 
 # ---------------------------------------------------------------------------
 # Endpoints
