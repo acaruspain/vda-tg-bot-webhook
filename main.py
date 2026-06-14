@@ -1,20 +1,27 @@
+import base64
+import io
 import logging
 import time
+import zipfile
+import zoneinfo
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
+from datetime import datetime, time as dtime, timezone
 from pathlib import Path
-from datetime import datetime
+from typing import Optional
 
+import httpx
 import os
 from dotenv import load_dotenv
 load_dotenv()  # loads .env locally; on Render use Environment Variables in dashboard
 
-from fastapi import FastAPI, Request
 from aiogram import Bot, Dispatcher, Router, types
 from aiogram.filters import Command
+from fastapi import FastAPI, HTTPException, Request
 
-# ---------------------------------------------------------------------------
+# =============================================================================
 # Logging
-# ---------------------------------------------------------------------------
+# =============================================================================
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -22,40 +29,39 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Environment
-# ---------------------------------------------------------------------------
-TOKEN = os.getenv("TOKEN")
+# =============================================================================
+# Config
+# =============================================================================
+TOKEN                  = os.getenv("TOKEN")
 RENDER_WEB_SERVICE_NAME = os.getenv("YOUR_RENDER_WEB_SERVICE_NAME")
 
 if not TOKEN or not RENDER_WEB_SERVICE_NAME:
     raise RuntimeError("Environment variables TOKEN or YOUR_RENDER_WEB_SERVICE_NAME are missing.")
 
-WEBHOOK_PATH = f"/bot/{TOKEN}"
-WEBHOOK_URL = f"https://{RENDER_WEB_SERVICE_NAME}.onrender.com{WEBHOOK_PATH}"
+WEBHOOK_PATH    = f"/bot/{TOKEN}"
+WEBHOOK_URL     = f"https://{RENDER_WEB_SERVICE_NAME}.onrender.com{WEBHOOK_PATH}"
 
-# ---------------------------------------------------------------------------
+DAILY_BOOK_PATH  = os.getenv("DAILY_BOOK_PATH",  "daily_book.txt")
+BOT_USERNAME     = os.getenv("BOT_USERNAME",      "")
+SUBSCRIBERS_PATH = os.getenv("SUBSCRIBERS_PATH",  "subscribers.txt")
+SERVER_TZ        = os.getenv("SERVER_TZ",         "UTC")
+TRIGGER_SECRET   = os.getenv("TRIGGER_SECRET",    "")
+COPYRIGHT_TEXT   = os.getenv("COPYRIGHT_TEXT",    "")
+
+# =============================================================================
 # TextService
-# ---------------------------------------------------------------------------
-
-def remove_last_line(text: str) -> str:
-    idx = text.rfind("\n")
-    return text[:idx] if idx != -1 else text
-
+# =============================================================================
 
 class TextService:
     DELIMITER = "📆 "
 
     def __init__(self, daily_book_path: str, bot_username: str = ""):
         self.daily_book_path = daily_book_path
-        self.bot_username = bot_username
+        self.bot_username    = bot_username
         self.texts: list[str] = []
         self._parse_book()
 
     def _parse_book(self) -> None:
-        import zipfile
-        import base64
-        import io
         path = Path(self.daily_book_path)
         if not path.exists():
             log.error("Daily-book file not found: %s", self.daily_book_path)
@@ -63,23 +69,16 @@ class TextService:
         try:
             if path.suffix == ".b64":
                 # base64-encoded zip — used for Render Secret Files (binary not supported)
-                b64 = path.read_text(encoding="utf-8")
-                zip_bytes = base64.b64decode(b64)
+                zip_bytes = base64.b64decode(path.read_text(encoding="utf-8"))
                 with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
-                    name = zf.namelist()[0]
-                    content = zf.read(name).decode("utf-8")
+                    content = zf.read(zf.namelist()[0]).decode("utf-8")
             elif path.suffix == ".zip":
                 with zipfile.ZipFile(path, "r") as zf:
-                    name = zf.namelist()[0]
-                    content = zf.read(name).decode("utf-8")
+                    content = zf.read(zf.namelist()[0]).decode("utf-8")
             else:
                 content = path.read_text(encoding="utf-8")
 
-            self.texts = [
-                f"{self.DELIMITER}{s}"
-                for s in content.split(self.DELIMITER)
-                if s
-            ]
+            self.texts = [f"{self.DELIMITER}{s}" for s in content.split(self.DELIMITER) if s]
             log.info("Daily book loaded: %d entries", len(self.texts))
         except Exception as exc:
             log.error("Error reading daily-book: %s", exc)
@@ -90,16 +89,14 @@ class TextService:
 
     def _day_index(self) -> int:
         today = datetime.now()
-        day_of_year = today.timetuple().tm_yday
+        day   = today.timetuple().tm_yday
         if not self._is_leap_year(today.year) and today.month >= 3:
-            day_of_year += 1
-        return day_of_year - 1  # 0-based
+            day += 1
+        return day - 1  # 0-based
 
     def get_daily_text(self) -> str:
         try:
-            entry = self.texts[self._day_index()]
-            blocks = entry.split("\n")
-            return self._format(blocks)
+            return self._format(self.texts[self._day_index()].split("\n"))
         except IndexError:
             log.error("No daily-text entry for today.")
             return "No entry available for today's date."
@@ -107,8 +104,7 @@ class TextService:
     def get_daily_text_preview(self, lines: int = 3) -> str:
         """First `lines` non-empty lines joined with ' | ' — for logging."""
         try:
-            entry = self.texts[self._day_index()]
-            non_empty = [ln for ln in entry.split("\n") if ln.strip()]
+            non_empty = [ln for ln in self.texts[self._day_index()].split("\n") if ln.strip()]
             return " | ".join(non_empty[:lines])
         except IndexError:
             return "(no entry)"
@@ -116,47 +112,54 @@ class TextService:
     def _format(self, blocks: list[str]) -> str:
         if len(blocks) < 4:
             return "\n".join(blocks)
-        date  = self._bold(blocks[0])
-        topic = self._bold(blocks[1])
-        quote = self._italic(blocks[2])
-        icon  = f'<a href="https://t.me/{self.bot_username}">🍀</a>' if self.bot_username else "🍀"
-        main_content = "\n\n".join(blocks[3:-2])
-        footer = self._italic(blocks[-2])
-        return "\n\n".join([date, topic, quote, main_content, footer, icon])
+        icon = f'<a href="https://t.me/{self.bot_username}">🍀</a>' if self.bot_username else "🍀"
+        return "\n\n".join([
+            self._bold(blocks[0]),
+            self._bold(blocks[1]),
+            self._italic(blocks[2]),
+            "\n\n".join(blocks[3:-2]),
+            self._italic(blocks[-2]),
+            icon,
+        ])
 
     @staticmethod
-    def _bold(text: str) -> str:
-        return f"<b>{text}</b>"
+    def _bold(text: str) -> str:   return f"<b>{text}</b>"
 
     @staticmethod
-    def _italic(text: str) -> str:
-        return f"<i>{text}</i>"
+    def _italic(text: str) -> str: return f"<i>{text}</i>"
+
+    def remove_last_line(self, text: str) -> str:
+        idx = text.rfind("\n")
+        return text[:idx] if idx != -1 else text
 
 
-# ---------------------------------------------------------------------------
+# =============================================================================
 # SubscriberService
-# format per line: HH:MM;chat_id;message_thread_id
-# message_thread_id — int, 0 or empty means no topic
-# ---------------------------------------------------------------------------
-from dataclasses import dataclass
-from datetime import time as dtime, timezone
-from typing import Optional
-
+# =============================================================================
+# Subscribers file format (one per line):
+#   HH:MM;chat_id;message_thread_id   [inline #comment allowed]
+#   message_thread_id — int, 0 or empty means no topic (regular chat)
+# Examples:
+#   11:00;111111111;         #admin
+#   10:00;-1222222222222;350 #test chat
+#   09:00;-1333333333333;783 #prod
+# Lines starting with # are ignored entirely.
 
 @dataclass
 class Subscriber:
-    chat_id: int
-    send_time: dtime
+    chat_id:           int
+    send_time:         dtime
     message_thread_id: Optional[int]  # None means regular chat, no topic
 
 
 class SubscriberService:
     TIME_FORMATTER = "%H:%M"
 
-    def __init__(self, file_path: str):
+    def __init__(self, file_path: str, server_tz: str = "UTC"):
         self.file_path = file_path
+        self.server_tz = server_tz
 
-    def get_subscribers(self) -> list:
+    def get_subscribers(self) -> list[Subscriber]:
         result = []
         try:
             with open(self.file_path, "r", encoding="utf-8") as f:
@@ -170,7 +173,7 @@ class SubscriberService:
                     try:
                         send_time  = datetime.strptime(parts[0], self.TIME_FORMATTER).time()
                         chat_id    = int(parts[1])
-                        thread_raw = parts[2].strip() if len(parts) > 2 else ""
+                        thread_raw = parts[2].split("#")[0].strip() if len(parts) > 2 else ""
                         thread_id  = int(thread_raw) if thread_raw and thread_raw != "0" else None
                         result.append(Subscriber(chat_id, send_time, thread_id))
                     except (ValueError, IndexError) as e:
@@ -179,76 +182,97 @@ class SubscriberService:
             log.warning("Subscribers file not found: %s", self.file_path)
         return result
 
-    def get_due_subscribers(self) -> list:
-        """Returns subscribers whose sent hour matches the current hour in SERVER_TZ timezone.
-        Hours in the subscriber file must be set in SERVER_TZ time."""
-        import zoneinfo
-        tz_name = os.getenv("SERVER_TZ", "UTC")
+    def get_due_subscribers(self) -> list[Subscriber]:
+        """Returns subscribers whose send hour matches the current hour in SERVER_TZ.
+        Hours in the subscribers file must be set in SERVER_TZ time."""
         try:
-            tz = zoneinfo.ZoneInfo(tz_name)
+            tz = zoneinfo.ZoneInfo(self.server_tz)
         except Exception:
             tz = timezone.utc
         now_hour = datetime.now(tz).hour
         return [s for s in self.get_subscribers() if s.send_time.hour == now_hour]
 
 
-# ---------------------------------------------------------------------------
-# Service init
-# ---------------------------------------------------------------------------
-DAILY_BOOK_PATH  = os.getenv("DAILY_BOOK_PATH", "daily.zip.b64")
-BOT_USERNAME     = os.getenv("BOT_USERNAME", "test-bot")
-SUBSCRIBERS_PATH = os.getenv("SUBSCRIBERS_PATH", "subscribers")
-
+# =============================================================================
+# Services init
+# =============================================================================
 text_service       = TextService(daily_book_path=DAILY_BOOK_PATH, bot_username=BOT_USERNAME)
-subscriber_service = SubscriberService(file_path=SUBSCRIBERS_PATH)
+subscriber_service = SubscriberService(file_path=SUBSCRIBERS_PATH, server_tz=SERVER_TZ)
 
-# ---------------------------------------------------------------------------
-# aiogram v3 setup
-# ---------------------------------------------------------------------------
-bot = Bot(token=TOKEN)
-dp  = Dispatcher()
+# =============================================================================
+# Bot & router (aiogram v3)
+# =============================================================================
+bot    = Bot(token=TOKEN)
+dp     = Dispatcher()
 router = Router()
 dp.include_router(router)
 
-# ---------------------------------------------------------------------------
-# Handlers  (aiogram v3 style)
-# ---------------------------------------------------------------------------
+
+def _start_markup() -> types.InlineKeyboardMarkup:
+    return types.InlineKeyboardMarkup(inline_keyboard=[
+        [types.InlineKeyboardButton(text="📖 Daily text", callback_data="/now")],
+        [types.InlineKeyboardButton(text="ℹ️ About",      callback_data="/about")],
+    ])
+
+
+async def _bot_description() -> str:
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.get(f"https://api.telegram.org/bot{TOKEN}/getMyDescription")
+            r.raise_for_status()
+            return r.json().get("result", {}).get("description", "")
+    except Exception as e:
+        log.error("Failed to get bot description: %s", e)
+        return ""
+
+
+# =============================================================================
+# Handlers
+# =============================================================================
 
 @router.message(Command("start"))
 async def start_handler(message: types.Message):
-    full_name = message.from_user.full_name
-    log.info("/start from %s (%s)", full_name, message.from_user.id)
-    await message.reply(
-        f"Hello, {full_name}!\n\nUse /now to get today's daily text."
-    )
+    log.info("/start from %s (%s)", message.from_user.full_name, message.from_user.id)
+    description = await _bot_description()
+    text = text_service.remove_last_line(description) if description else f"Hello, {message.from_user.full_name}!"
+    await message.answer(text, reply_markup=_start_markup(), parse_mode="HTML", disable_web_page_preview=True)
 
 
 @router.message(Command("now"))
-async def now_handler(message: types.Message):
-    log.info("/now from %s (%s)", message.from_user.full_name, message.from_user.id)
-    text = text_service.get_daily_text()
-    await message.answer(text, parse_mode="HTML", disable_web_page_preview=True)
+@router.callback_query(lambda c: c.data == "/now")
+async def now_handler(event: types.Message | types.CallbackQuery):
+    msg = event.message if isinstance(event, types.CallbackQuery) else event
+    log.info("/now from %s (%s)", event.from_user.full_name, event.from_user.id)
+    await msg.answer(text_service.get_daily_text(), parse_mode="HTML", disable_web_page_preview=True)
+    if isinstance(event, types.CallbackQuery):
+        await event.answer()
+
+
+@router.message(Command("about"))
+@router.message(Command("developer_info"))
+@router.callback_query(lambda c: c.data == "/about")
+async def about_handler(event: types.Message | types.CallbackQuery):
+    msg = event.message if isinstance(event, types.CallbackQuery) else event
+    log.info("/about from %s (%s)", event.from_user.full_name, event.from_user.id)
+    await msg.answer(COPYRIGHT_TEXT, parse_mode="HTML", disable_web_page_preview=True)
+    if isinstance(event, types.CallbackQuery):
+        await event.answer()
 
 
 @router.message()
 async def fallback_handler(message: types.Message):
-    log.info(
-        "Message from %s (%s) at %s: %s",
-        message.from_user.full_name,
-        message.from_user.id,
-        time.asctime(),
-        message.text,
-    )
+    log.info("Message from %s (%s) at %s: %s",
+             message.from_user.full_name, message.from_user.id, time.asctime(), message.text)
     await message.reply("Unknown command. Try /now.")
 
 
-# ---------------------------------------------------------------------------
-# FastAPI lifespan (replaces deprecated on_event)
-# ---------------------------------------------------------------------------
+# =============================================================================
+# FastAPI lifespan
+# =============================================================================
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # --- startup ---
+    # startup
     log.info("Starting application — checking webhook configuration.")
     webhook_info = await bot.get_webhook_info()
     if webhook_info.url != WEBHOOK_URL:
@@ -256,57 +280,62 @@ async def lifespan(app: FastAPI):
         log.info("Webhook set to: %s", WEBHOOK_URL)
     else:
         log.info("Webhook already set correctly.")
-
-    tz_name = os.getenv("SERVER_TZ", "UTC")
-    log.info("Timezone: %s — hours in subscribers file must be in %s", tz_name, tz_name)
-    preview = text_service.get_daily_text_preview(lines=3)
-    log.info("=== Daily text preview (startup) === %s", preview)
+    log.info("Timezone: %s — hours in subscribers file must be in %s", SERVER_TZ, SERVER_TZ)
+    log.info("=== Daily text preview (startup) === %s", text_service.get_daily_text_preview(lines=3))
 
     yield  # app is running
 
-    # --- shutdown ---
+    # shutdown
     log.info("Shutting down — closing bot session.")
     await bot.session.close()
 
 
-# docs enabled only when TRIGGER_SECRET is not set (local dev)
-_local = not os.getenv("TRIGGER_SECRET")
+# =============================================================================
+# FastAPI app & endpoints
+# =============================================================================
+_local = not TRIGGER_SECRET
 app = FastAPI(
     lifespan=lifespan,
-    docs_url="/docs" if _local else None,
-    redoc_url="/redoc" if _local else None,
-    openapi_url="/openapi.json" if _local else None,
+    docs_url     ="/docs"        if _local else None,
+    redoc_url    ="/redoc"       if _local else None,
+    openapi_url  ="/openapi.json" if _local else None,
 )
 
-# ---------------------------------------------------------------------------
-# Endpoints
-# ---------------------------------------------------------------------------
+_last_sent_hour: int = -1  # in-memory guard: send only once per hour
 
-_last_sent_hour: int = -1  # tracks the last hour a broadcast was sent
+
+def _check_secret(secret: str) -> None:
+    if not secret or secret != TRIGGER_SECRET:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+
+@app.get("/")
+async def health_check():
+    return {"status": "ok"}
+
 
 @app.get("/hourly-trigger")
 async def hourly_trigger(secret: str = ""):
     global _last_sent_hour
-    from fastapi import HTTPException
-    import zoneinfo
-    if not secret or secret != os.getenv("TRIGGER_SECRET", ""):
-        raise HTTPException(status_code=403, detail="Forbidden")
+    _check_secret(secret)
 
-    tz = zoneinfo.ZoneInfo(os.getenv("SERVER_TZ", "UTC"))
+    try:
+        tz = zoneinfo.ZoneInfo(SERVER_TZ)
+    except Exception:
+        tz = timezone.utc
     current_hour = datetime.now(tz).hour
 
     if current_hour == _last_sent_hour:
         log.info("Already sent this hour (%d), skipping.", current_hour)
         return {"status": "skipped", "reason": "already sent this hour"}
 
-    preview = text_service.get_daily_text_preview(lines=3)
-    log.info("=== Hourly trigger fired === %s", preview)
+    preview  = text_service.get_daily_text_preview(lines=3)
+    all_subs = subscriber_service.get_subscribers()
+    due      = subscriber_service.get_due_subscribers()
 
-    all_subscribers = subscriber_service.get_subscribers()
-    due = subscriber_service.get_due_subscribers()
-    log.info("Current hour: %02d — %d/%d subscriber(s) scheduled now:",
-             current_hour, len(due), len(all_subscribers))
-    for sub in all_subscribers:
+    log.info("=== Hourly trigger fired === %s", preview)
+    log.info("Current hour: %02d — %d/%d subscriber(s) scheduled now:", current_hour, len(due), len(all_subs))
+    for sub in all_subs:
         marker = ">>> SEND" if sub.send_time.hour == current_hour else "    wait"
         log.info("  %s  chat_id=%-20s thread=%-6s at %s",
                  marker, sub.chat_id, sub.message_thread_id or "-", sub.send_time.strftime("%H:%M"))
@@ -336,25 +365,17 @@ async def hourly_trigger(secret: str = ""):
 async def handle_webhook(request: Request):
     data = await request.json()
     log.debug("Received update: %s", data)
-    update = types.Update(**data)
-    await dp.feed_update(bot=bot, update=update)
+    await dp.feed_update(bot=bot, update=types.Update(**data))
     return {"ok": True}
-
-
-@app.get("/")
-async def health_check():
-    return {"status": "ok"}
 
 
 @app.get("/debug/now")
 async def debug_now(secret: str = ""):
     """Local dev only — daily text preview in the browser."""
-    from fastapi import HTTPException
-    if not secret or secret != os.getenv("TRIGGER_SECRET", ""):
-        raise HTTPException(status_code=403, detail="Forbidden")
+    _check_secret(secret)
     return {
-        "preview": text_service.get_daily_text_preview(lines=5),
-        "subscribers_due": len(subscriber_service.get_due_subscribers()),
+        "preview":          text_service.get_daily_text_preview(lines=5),
+        "subscribers_due":  len(subscriber_service.get_due_subscribers()),
     }
 
 
