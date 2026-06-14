@@ -41,7 +41,7 @@ if not TOKEN or not RENDER_WEB_SERVICE_NAME:
 WEBHOOK_PATH    = f"/bot/{TOKEN}"
 WEBHOOK_URL     = f"https://{RENDER_WEB_SERVICE_NAME}.onrender.com{WEBHOOK_PATH}"
 
-DAILY_BOOK_PATH  = os.getenv("DAILY_BOOK_PATH",  "daily_book.txt")
+DAILY_BOOK_PATH  = os.getenv("DAILY_BOOK_PATH",  "daily.zip.b64")
 BOT_USERNAME     = os.getenv("BOT_USERNAME",      "")
 SUBSCRIBERS_PATH = os.getenv("SUBSCRIBERS_PATH",  "subscribers.txt")
 SERVER_TZ        = os.getenv("SERVER_TZ",         "UTC")
@@ -254,7 +254,8 @@ async def now_handler(event: types.Message | types.CallbackQuery):
 async def about_handler(event: types.Message | types.CallbackQuery):
     msg = event.message if isinstance(event, types.CallbackQuery) else event
     log.info("/about from %s (%s)", event.from_user.full_name, event.from_user.id)
-    await msg.answer(COPYRIGHT_TEXT, parse_mode="HTML", disable_web_page_preview=True)
+    text = COPYRIGHT_TEXT.replace("\\n", "\n").replace("{SERVER_TZ}", SERVER_TZ)
+    await msg.answer(text, parse_mode="HTML", disable_web_page_preview=True)
     if isinstance(event, types.CallbackQuery):
         await event.answer()
 
