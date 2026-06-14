@@ -38,6 +38,11 @@ WEBHOOK_URL = f"https://{RENDER_WEB_SERVICE_NAME}.onrender.com{WEBHOOK_PATH}"
 # TextService
 # ---------------------------------------------------------------------------
 
+def remove_last_line(text: str) -> str:
+    idx = text.rfind("\n")
+    return text[:idx] if idx != -1 else text
+
+
 class TextService:
     DELIMITER = "📆 "
 
@@ -127,14 +132,10 @@ class TextService:
     def _italic(text: str) -> str:
         return f"<i>{text}</i>"
 
-    def remove_last_line(self, text: str) -> str:
-        idx = text.rfind("\n")
-        return text[:idx] if idx != -1 else text
-
 
 # ---------------------------------------------------------------------------
 # SubscriberService
-# format per line:  HH:MM;chat_id;message_thread_id
+# format per line: HH:MM;chat_id;message_thread_id
 # message_thread_id — int, 0 or empty means no topic
 # ---------------------------------------------------------------------------
 from dataclasses import dataclass
@@ -179,8 +180,15 @@ class SubscriberService:
         return result
 
     def get_due_subscribers(self) -> list:
-        """Returns subscribers whose send hour matches the current UTC hour."""
-        now_hour = datetime.now(timezone.utc).hour
+        """Returns subscribers whose sent hour matches the current hour in SERVER_TZ timezone.
+        Hours in the subscriber file must be set in SERVER_TZ time."""
+        import zoneinfo
+        tz_name = os.getenv("SERVER_TZ", "UTC")
+        try:
+            tz = zoneinfo.ZoneInfo(tz_name)
+        except Exception:
+            tz = timezone.utc
+        now_hour = datetime.now(tz).hour
         return [s for s in self.get_subscribers() if s.send_time.hour == now_hour]
 
 
@@ -249,6 +257,8 @@ async def lifespan(app: FastAPI):
     else:
         log.info("Webhook already set correctly.")
 
+    tz_name = os.getenv("SERVER_TZ", "UTC")
+    log.info("Timezone: %s — hours in subscribers file must be in %s", tz_name, tz_name)
     preview = text_service.get_daily_text_preview(lines=3)
     log.info("=== Daily text preview (startup) === %s", preview)
 
@@ -272,16 +282,34 @@ app = FastAPI(
 # Endpoints
 # ---------------------------------------------------------------------------
 
+_last_sent_hour: int = -1  # tracks the last hour a broadcast was sent
+
 @app.get("/hourly-trigger")
 async def hourly_trigger(secret: str = ""):
+    global _last_sent_hour
     from fastapi import HTTPException
+    import zoneinfo
     if not secret or secret != os.getenv("TRIGGER_SECRET", ""):
         raise HTTPException(status_code=403, detail="Forbidden")
+
+    tz = zoneinfo.ZoneInfo(os.getenv("SERVER_TZ", "UTC"))
+    current_hour = datetime.now(tz).hour
+
+    if current_hour == _last_sent_hour:
+        log.info("Already sent this hour (%d), skipping.", current_hour)
+        return {"status": "skipped", "reason": "already sent this hour"}
+
     preview = text_service.get_daily_text_preview(lines=3)
     log.info("=== Hourly trigger fired === %s", preview)
 
+    all_subscribers = subscriber_service.get_subscribers()
     due = subscriber_service.get_due_subscribers()
-    log.info("Sending to %d subscriber(s)", len(due))
+    log.info("Current hour: %02d — %d/%d subscriber(s) scheduled now:",
+             current_hour, len(due), len(all_subscribers))
+    for sub in all_subscribers:
+        marker = ">>> SEND" if sub.send_time.hour == current_hour else "    wait"
+        log.info("  %s  chat_id=%-20s thread=%-6s at %s",
+                 marker, sub.chat_id, sub.message_thread_id or "-", sub.send_time.strftime("%H:%M"))
 
     text = text_service.get_daily_text()
     sent, failed = 0, 0
@@ -300,6 +328,7 @@ async def hourly_trigger(secret: str = ""):
             log.error("Failed chat_id=%s thread=%s: %s", sub.chat_id, sub.message_thread_id, e)
             failed += 1
 
+    _last_sent_hour = current_hour
     return {"status": "ok", "preview": preview, "sent": sent, "failed": failed}
 
 
